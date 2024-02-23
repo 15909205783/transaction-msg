@@ -3,6 +3,8 @@ package com.example.transactionmsg;
 import com.example.transactionmsg.Util.DB;
 import com.example.transactionmsg.common.ApplicationUtil;
 import com.example.transactionmsg.common.TXMQVersion;
+import com.example.transactionmsg.common.message.Message;
+import com.example.transactionmsg.common.message.MessageAccessor;
 import com.example.transactionmsg.constant.ClientInitException;
 import com.example.transactionmsg.hook.SendTXMsgHook;
 import com.google.common.base.Strings;
@@ -10,33 +12,28 @@ import java.sql.Connection;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Map.Entry;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.regex.Matcher;
 import org.apache.pulsar.client.api.AuthenticationFactory;
 import org.apache.pulsar.client.api.ClientBuilder;
 import org.apache.pulsar.client.api.Producer;
 import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.PulsarClientException;
-import org.apache.rocketmq.client.producer.DefaultMQProducer;
-import org.apache.rocketmq.common.MQVersion;
-import org.apache.rocketmq.common.message.Message;
-import org.apache.rocketmq.common.message.MessageAccessor;
 import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.util.CollectionUtils;
 
 public abstract class TransactionMsgClient {
 
   protected static final Logger log = LoggerFactory.getLogger(TransactionMsgClient.class);
 
-  private final String producerName;
   private final String appName;
   private static final int minDelay = 0;
   private static final int maxDelay = 7776000;
 
-  private DefaultMQProducer producer;
   private String mqAddr;
   private List<DBDataSource> dbDataSources;
   protected MsgProcessor msgProcessor;
@@ -47,29 +44,31 @@ public abstract class TransactionMsgClient {
   private List<SendTXMsgHook> sendHookList;
   private RedissonClient redissonClient;
 
-  private Producer<byte[]> pulsarProducer;
+  private final Map<String, Producer<byte[]>> producerMap;
 
 
   protected TransactionMsgClient(RedissonClient redissonClient, String mqAddr, List<DBDataSource> dbDataSources,
       List<String> topicLists, Config config) throws PulsarClientException, ClientInitException {
     TXMQVersion.setCurrentVersionProp();
+    if (CollectionUtils.isEmpty(topicLists)) {
+      throw new ClientInitException("topicList is empty");
+    }
 
     PulsarClient pulsarClient = pulsarClient(config);
-    this.pulsarProducer = pulsarClient.newProducer()
-        //topic完整路径，格式为persistent://集群（租户）ID/命名空间/Topic名称
-        .topic("persistent://pulsar-jegz795k7km7/wms_test/PAAS_GET_SHEET")
-        .create();
-
+    producerMap = new HashMap<>();
+    for (String topic : topicLists) {
+      Producer<byte[]> pulsarProducer = pulsarClient.newProducer()
+          //topic完整路径，格式为persistent://集群（租户）ID/命名空间/Topic名称
+          .topic(topic)
+          .create();
+      producerMap.put(topic, pulsarProducer);
+    }
 
     this.mqAddr = mqAddr;
     this.dbDataSources = dbDataSources;
     this.appName = ApplicationUtil.getApplicationName();
     this.msgStorage = new MsgStorage(dbDataSources, topicLists);
-    this.producer = new DefaultMQProducer();
-    this.producerName = this.buildProducerGroupName();
-    this.producer.setProducerGroup(this.producerName);
-    this.producer.setNamesrvAddr(this.mqAddr);
-    this.msgProcessor = new MsgProcessor(this.producer, this.pulsarProducer, this.msgStorage);
+    this.msgProcessor = new MsgProcessor(producerMap, this.msgStorage);
     this.config = config;
     this.state = new AtomicReference(State.CREATE);
     this.redissonClient = redissonClient;
@@ -92,13 +91,10 @@ public abstract class TransactionMsgClient {
       }
 
       try {
-//        this.producer.start();
         this.msgProcessor.init(this.config, this.redissonClient);
         this.msgProcessor.registerSendHookList(this.sendHookList);
         this.msgStorage.init(this.config);
         this.localIp = SystemEnvUtil.getIp();
-        log.info("[ARCH_TXMQ_INIT] end init success, the tx msg version is {}, mq version is {}",
-            TXMQVersion.CURRENT_VERSION, MQVersion.value2Version(MQVersion.CURRENT_VERSION));
       } catch (Exception e) {
         log.error("producer start fail", e);
         throw e;
@@ -113,7 +109,6 @@ public abstract class TransactionMsgClient {
     if (this.state.compareAndSet(State.RUNNING, State.CLOSED)) {
       this.msgProcessor.close();
       this.msgStorage.close();
-      this.producer.shutdown();
     } else {
       log.info("state not right {} ", this.state);
     }
@@ -138,10 +133,7 @@ public abstract class TransactionMsgClient {
             throw new Exception("send tx msg but connection not in transaction.");
           }
 
-          Message message = new Message();
-          MessageAccessor.setProperties(message, new HashMap());
-
-          Entry<Long, DB> idUrlPair = MsgStorage.insertMsg(con, content, topic, tag, delay, message.getProperties());
+          Entry<Long, DB> idUrlPair = MsgStorage.insertMsg(con, content, topic, tag, delay);
 
           id = idUrlPair.getKey();
           Msg msg = new Msg(id, idUrlPair.getValue(), topic);
@@ -149,7 +141,7 @@ public abstract class TransactionMsgClient {
 
         } catch (Exception e) {
 
-          log.error("sendMsg fail topic {} tag {} ", new Object[]{topic, tag, e});
+          log.error("sendMsg fail topic {} tag {} ", topic, tag, e);
           throw e;
         }
       }
@@ -160,24 +152,6 @@ public abstract class TransactionMsgClient {
       throw new Exception("delay can't <0 or > 7776000");
     }
 
-  }
-
-  private String buildProducerGroupName() {
-    String tmpGroup;
-    if (this.appName != null && !this.appName.isEmpty()) {
-      tmpGroup = "TransactionMsgProducer-" + this.appName;
-    } else {
-      tmpGroup = "TransactionMsgProducer-" + this.producer.buildMQClientId();
-    }
-
-    Matcher matcher = Util.PATTERN.matcher(tmpGroup);
-    StringBuffer groupBuffer = new StringBuffer();
-
-    while (matcher.find()) {
-      groupBuffer.append(matcher.group());
-    }
-
-    return groupBuffer.toString();
   }
 
   public String getMqAddr() {
@@ -210,7 +184,7 @@ public abstract class TransactionMsgClient {
           "[ARCH_TXMQ_INIT] TransactionMsgClient has inited, can't register TXMsgSendSuccessListener");
     } else {
       if (this.sendHookList == null) {
-        this.sendHookList = new ArrayList();
+        this.sendHookList = new ArrayList<>();
       }
 
       this.sendHookList.add(hook);

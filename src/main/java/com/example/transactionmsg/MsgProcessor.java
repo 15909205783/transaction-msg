@@ -1,7 +1,9 @@
 package com.example.transactionmsg;
 
 import com.example.transactionmsg.Util.DB;
+import com.example.transactionmsg.common.SendResult;
 import com.example.transactionmsg.common.SystemEnvType;
+import com.example.transactionmsg.common.message.Message;
 import com.example.transactionmsg.hook.SendTXMsgHook;
 import java.io.UnsupportedEncodingException;
 import java.nio.charset.StandardCharsets;
@@ -28,17 +30,13 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import javax.sql.DataSource;
-import org.apache.pulsar.client.api.Message;
 import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.Producer;
-import org.apache.rocketmq.client.producer.DefaultMQProducer;
-import org.apache.rocketmq.client.producer.SendResult;
-import org.apache.rocketmq.client.producer.SendStatus;
-import org.apache.rocketmq.common.message.MessageDecoder;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.util.CollectionUtils;
 
 public class MsgProcessor {
 
@@ -57,7 +55,6 @@ public class MsgProcessor {
   private PriorityBlockingQueue<Msg> timeWheelQueue;
   private ScheduledExecutorService scheService;
   private AtomicReference<State> state;
-  private DefaultMQProducer producer;
   private MsgStorage msgStorage;
   private Config config;
   private volatile boolean holdLock = true;
@@ -67,16 +64,15 @@ public class MsgProcessor {
 
   private RedissonClient redissonClient;
 
-  Producer<byte[]> pulsarProducer;
+  private final Map<String, Producer<byte[]>> producerMap;
 
   static {
     maxDealTime = timeOutData.length;
     log = LoggerFactory.getLogger(MsgProcessor.class);
   }
 
-  public MsgProcessor(DefaultMQProducer producer, Producer<byte[]> pulsarProducer, MsgStorage msgStorage) {
-    this.producer = producer;
-    this.pulsarProducer = pulsarProducer;
+  public MsgProcessor(Map<String, Producer<byte[]>> producerMap, MsgStorage msgStorage) {
+    this.producerMap = producerMap;
     this.msgStorage = msgStorage;
     this.msgQueue = new PriorityBlockingQueue(5000, new Comparator<Msg>() {
       public int compare(Msg o1, Msg o2) {
@@ -142,8 +138,10 @@ public class MsgProcessor {
       }
 
       this.scheService.scheduleAtFixedRate(new MsgProcessor.MsgTimeWheelRunnable(), 5L, 5L, TimeUnit.MILLISECONDS);
+
       this.scheService.scheduleAtFixedRate(new ScheduleScanMsgRunnable(), config.schedScanTimePeriod,
           config.schedScanTimePeriod, TimeUnit.SECONDS);
+
       this.scheService.scheduleAtFixedRate(new MsgProcessor.DeleteMsgRunnable(), config.deleteTimePeriod,
           config.deleteTimePeriod, TimeUnit.SECONDS);
       this.scheService.scheduleAtFixedRate(() -> {
@@ -236,17 +234,7 @@ public class MsgProcessor {
     String tag = msgInfo.getTag();
     String content = msgInfo.getContent();
     String id = msgInfo.getId() + "";
-    String propertiesStr = msgInfo.getPropertiesStr();
     Message msg = new Message(topic, tag, id, content.getBytes("UTF-8"));
-    if (propertiesStr != null && !propertiesStr.isEmpty()) {
-      Map<String, String> properties = MessageDecoder.string2messageProperties(propertiesStr);
-      Iterator<Entry<String, String>> iterator = properties.entrySet().iterator();
-
-      while (iterator.hasNext()) {
-        Entry<String, String> entry = iterator.next();
-        msg.putUserProperty(entry.getKey(), entry.getValue());
-      }
-    }
 
     String header = String.format("{\"topic\":\"%s\",\"tag\":\"%s\",\"id\":\"%s\",\"createTime\":\"%s\"}", topic, tag,
         id, System.currentTimeMillis());
@@ -332,26 +320,29 @@ public class MsgProcessor {
         } catch (SQLException e) {
           e.printStackTrace();
         }
+        if (CollectionUtils.isEmpty(list)) {
+          log.info("定时扫描发送消息时，未查询到有任何需要发送的数据");
+          return;
+        }
         num = list.size();
         if (num > 0) {
           MsgProcessor.log.debug("[ARCH_TXMQ_SCANNER] scan db get msg size {} ", num);
         }
 
         count += num;
-        Iterator<MsgInfo> iterator = list.iterator();
 
-        while (iterator.hasNext()) {
-          MsgInfo msgInfo = iterator.next();
-
+        for (MsgInfo msgInfo : list) {
           try {
             Message mqMsg = MsgProcessor.buildMsg(msgInfo);
-            SendResult result = MsgProcessor.this.pulsarProducer.send(mqMsg);
-            MsgProcessor.log.info("[ARCH_TXMQ_SCANNER] msgId {} topic {} sendMsg result {}", msgInfo.getId(),
-                mqMsg.getTopic(), result);
-            if (result != null && result.getSendStatus() == SendStatus.SEND_OK) {
+            final MessageId messageId = MsgProcessor.this.producerMap.get(mqMsg.getTopic()).send(
+                mqMsg.toString().getBytes(StandardCharsets.UTF_8));
+            MsgProcessor.log.info("[ARCH_TXMQ_SCANNER] msgId {} topic {} sendMsg result messageId {}", msgInfo.getId(),
+                mqMsg.getTopic(), messageId);
+
+            if (Objects.nonNull(messageId)) {
               int res = MsgProcessor.this.msgStorage.deleteMsgByID(dataSrc, msgInfo.getId());
               MsgProcessor.log.debug("[ARCH_TXMQ_SCANNER] msgId {} deleteMsgByID success res {}", msgInfo.getId(), res);
-              MsgProcessor.this.executeHookAfterSendSuccess(mqMsg, result);
+              MsgProcessor.this.executeHookAfterSendSuccess(mqMsg, new SendResult(messageId));
             }
           } catch (Exception e) {
             MsgProcessor.log.error("[ARCH_TXMQ_SCANNER] SchedScanMsg deal fail", e);
@@ -454,7 +445,7 @@ public class MsgProcessor {
             msg = MsgProcessor.this.msgQueue.poll(100L, TimeUnit.MILLISECONDS);
 
           } catch (InterruptedException e) {
-            MsgProcessor.log.error("消息出队列失败，{}", e);
+            MsgProcessor.log.error("消息出队列失败：", e);
           }
 
           if (msg != null) {
@@ -485,23 +476,20 @@ public class MsgProcessor {
                 msgInfo.setCreate_time(new Date(msg.getCreateTime()));
                 Message mqMsg = MsgProcessor.buildMsg(msgInfo);
                 MsgProcessor.log.debug("[ARCH_TXMQ_PROCESSOR] will sendMsg {}", mqMsg);
-                SendResult result = MsgProcessor.this.producer.send(mqMsg);
 
-               final MessageId messageId = MsgProcessor.this.pulsarProducer.send(
+                final MessageId messageId = MsgProcessor.this.producerMap.get(msgInfo.getTopic()).send(
                     mqMsg.toString().getBytes(StandardCharsets.UTF_8));
-
-                log.info("Pulsar消息发送成功,messageId: {}", messageId.toString());
 
                 MsgProcessor.log.info(
                     "[ARCH_TXMQ_PROCESSOR] msgId {} topic {} haveDealedTimes={}, createTime={} sendMsg result {}",
-                    msgInfo.getId(), mqMsg.getTopic(), msg.getHaveDealedTimes(), msg.getCreateTime(), result);
-                if (null != result && result.getSendStatus() == SendStatus.SEND_OK) {
-                  if (result.getSendStatus() == SendStatus.SEND_OK) {
-                    int res = MsgProcessor.this.msgStorage.deleteMsgByID(msg.getDb(), msg.getId());
-                    MsgProcessor.log.debug("[ARCH_TXMQ_PROCESSOR] msgId {} deleteMsgByID success res {}",
-                        msgInfo.getId(), res);
-                    MsgProcessor.this.executeHookAfterSendSuccess(mqMsg, result);
-                  }
+                    msgInfo.getId(), mqMsg.getTopic(), msg.getHaveDealedTimes(), msg.getCreateTime(), messageId);
+                if (Objects.nonNull(messageId)) {
+                  log.info("Pulsar消息发送成功,messageId: {}", messageId);
+                  int res = MsgProcessor.this.msgStorage.deleteMsgByID(msg.getDb(), msg.getId());
+                  MsgProcessor.log.debug("[ARCH_TXMQ_PROCESSOR] msgId {} deleteMsgByID success res {}", msgInfo.getId(),
+                      res);
+                  MsgProcessor.this.executeHookAfterSendSuccess(mqMsg, new SendResult(messageId));
+
                 } else if (dealedTime < MsgProcessor.maxDealTime) {
                   long nextExpireTimex = System.currentTimeMillis() + (long) MsgProcessor.timeOutData[dealedTime];
                   msg.setNextExpireTime(nextExpireTimex);

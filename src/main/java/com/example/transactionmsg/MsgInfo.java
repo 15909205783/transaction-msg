@@ -10,7 +10,6 @@ public class MsgInfo {
   private String tag;
   private Date create_time;
   private int delay;
-  private String propertiesStr;
 
   public MsgInfo() {
   }
@@ -63,15 +62,8 @@ public class MsgInfo {
     return this.delay;
   }
 
-  public void setPropertiesStr(String propertiesStr) {
-    this.propertiesStr = propertiesStr;
-  }
-
-  public String getPropertiesStr() {
-    return this.propertiesStr;
-  }
 
   public String toString() {
-    return (new StringJoiner(", ", MsgInfo.class.getSimpleName() + "[", "]")).add("id=" + this.id).add("content='" + this.content + "'").add("topic='" + this.topic + "'").add("tag='" + this.tag + "'").add("create_time=" + this.create_time).add("delay=" + this.delay).add("propertiesStr='" + this.propertiesStr + "'").toString();
+    return (new StringJoiner(", ", MsgInfo.class.getSimpleName() + "[", "]")).add("id=" + this.id).add("content='" + this.content + "'").add("topic='" + this.topic + "'").add("tag='" + this.tag + "'").add("create_time=" + this.create_time).add("delay=" + this.delay).toString();
   }
 }

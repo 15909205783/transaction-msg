@@ -28,13 +28,13 @@ import org.slf4j.LoggerFactory;
 public class MsgStorage {
 
   private static String tableName = "mq_messages";
-  private static String insertSQL = "insert into %s(content,topic,tag,delay,properties,create_time) values(?,?,?,?,?,?) ";
+  private static String insertSQL = "insert into %s(content,topic,tag,delay,create_time) values(?,?,?,?,?) ";
   private static String deleteMsgByIDSQL = "DELETE FROM %s WHERE ID ";
   private static String logicDeleteMsgByIDSQL = "UPDATE %s SET deleted = 1 WHERE ID ";
 
-  private static String selectByIdSQL = "select id,content,topic,tag,create_time,delay,properties from %s where id=? ";
-  private static String selectWaitingMsgSQL = "select id,content,topic,tag,create_time,delay,properties from %s where create_time <= ? order by id limit ?";
-  private static String selectWaitingMsgWithTopicsSQL = "select id,content,topic,tag,create_time,delay,properties from %s where create_time <= ? and topic in ";
+  private static String selectByIdSQL = "select id,content,topic,tag,create_time,delay from %s where id=? ";
+  private static String selectWaitingMsgSQL = "select id,content,topic,tag,create_time,delay from %s where create_time <= ? order by id limit ?";
+  private static String selectWaitingMsgWithTopicsSQL = "select id,content,topic,tag,create_time,delay from %s where create_time <= ? and topic in ";
   private static String selectMsgIDSQL = "SELECT ID FROM %s WHERE create_time <= ? LIMIT ?";
   private static String selectTableCountSQL = "SELECT count(1) FROM %s";
   private static String checkAddedColumnSQL = "SELECT count(column_name) FROM information_schema.columns WHERE table_schema = DATABASE() and table_name = '%s' AND column_name = ?";
@@ -86,7 +86,6 @@ public class MsgStorage {
         result.setTestWhileIdle(true);
         result.setValidationQuery("SELECT 1 FROM DUAL;");
         this.checkAddedColumnExists(result, "delay");
-        this.checkAddedColumnExists(result, "properties");
         String jdbcUrl = dbSrc.getUrl();
         this.dataSourcesMap.put(jdbcUrl, result);
         this.dbUrlMapping.put(Util.getDataBase(jdbcUrl), jdbcUrl);
@@ -162,17 +161,13 @@ public class MsgStorage {
 
   }
 
-  public static Entry<Long, DB> insertMsg(Connection con, String content, String topic, String tag, int delay
-      , Map<String, String> properties) throws SQLException {
+  public static Entry<Long, DB> insertMsg(Connection con, String content, String topic, String tag, int delay) throws SQLException {
     PreparedStatement psmt = null;
     ResultSet results = null;
 
     SimpleEntry idUrlPair;
     try {
-      String propertiesStr = null;
-//      if (properties != null) {
-//        propertiesStr = MessageDecoder.messageProperties2String(properties);
-//      }
+
 
       psmt = con.prepareStatement(insertSQL, 1);
       DatabaseMetaData metaData = con.getMetaData();
@@ -181,13 +176,8 @@ public class MsgStorage {
       psmt.setString(2, topic);
       psmt.setString(3, tag);
       psmt.setInt(4, delay);
-      if (propertiesStr != null) {
-        psmt.setString(5, propertiesStr);
-      } else {
-        psmt.setNull(5, 12);
-      }
 
-      psmt.setTimestamp(6, new Timestamp(System.currentTimeMillis()));
+      psmt.setTimestamp(5, new Timestamp(System.currentTimeMillis()));
       psmt.executeUpdate();
       results = psmt.getGeneratedKeys();
       Long id = null;
@@ -236,7 +226,6 @@ public class MsgStorage {
           msgInfo.setTag(rs.getString(4));
           msgInfo.setCreate_time(rs.getTimestamp(5));
           msgInfo.setDelay(rs.getInt(6));
-          msgInfo.setPropertiesStr(rs.getString(7));
         }
 
         return msgInfo;
@@ -308,7 +297,6 @@ public class MsgStorage {
         msgInfo.setTag(rs.getString(4));
         msgInfo.setCreate_time(rs.getTimestamp(5));
         msgInfo.setDelay(rs.getInt(6));
-        msgInfo.setPropertiesStr(rs.getString(7));
         list.add(msgInfo);
       }
 
